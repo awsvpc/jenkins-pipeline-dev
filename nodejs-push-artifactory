@@ -1,0 +1,57 @@
+pipeline {
+    agent any
+    environment {
+    def uploadSpec = """{
+     "files": [
+      {
+          "pattern": "dist/*",
+          "target": "repo/folder/"
+        }
+     ]
+    }"""
+    }
+    
+    stages {
+        stage('Build') {
+            steps {
+                echo 'Building..'
+                sh 'npm install --quiet'
+            }
+        }
+        stage('Test') {
+            steps {
+                echo 'Run Unit Tests..'
+                sh 'npm test'
+            }
+        }
+        stage('Publish') {
+            steps {
+                echo 'Build the artifacts..'
+                sh 'npx oclif-dev pack'
+                echo 'Publish the artifacts..'
+                    script
+                        {
+                        //def server = Artifactory.newServer('http://10.213.243.17:8081/artifactory', 'admin', 'art@123')
+                        def server = Artifactory.server 'Artifac_dev_server1'
+                        server.bypassProxy = true
+                        server.upload(uploadSpec)
+                        echo 'Uploaded the file to Jfrog Artifactory successfully'
+                        }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                echo 'TO BE BUILT'
+            }
+        }
+        stage('Notify') {
+            steps {
+                echo 'Mail Notification...'
+                mail body: 'Project build successful for job named testpipeline-1',
+                from: 'test1@gmail.com',
+                subject: 'project build successful',
+                to: 'test2@gmail.com'
+            }
+        }
+    }
+}
