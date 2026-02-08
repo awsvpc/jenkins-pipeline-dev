@@ -1,0 +1,105 @@
+#!/usr/bin/groovy
+
+kaniko_agent = 'dot-kaniko-executor'
+java_agent ='dot-slave-with-java-build-tools'
+def server = Artifactory.server 'artifactory'
+def rtMaven = Artifactory.newMavenBuild()
+def publishBuildArtifact = true
+def buildInfo 
+
+class DnBArtifactory {
+//Project Info for Docker build
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+public static final String repo_name = 'https://github.com/dnb-main/eus-gms-core-json-lz.git'
+public static final String branch_name = 'feature/CCT-3320'
+public static final String image_name = 'gms/gms_core_json_lz'
+//public static final String image_version = new Date().format( 'yyyyMMddHHmm' )
+public static final String image_version_prefix = 'master'
+public static final boolean promoteToPreRelease = true
+public static final boolean promoteToRelease = true
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+
+public static final String DOCKER_SNAPSHOT_REGISTRY ='dot-docker-snapshot-local'
+public static final String DOCKER_PRERELEASE_REGISTRY ='dot-docker-prerelease-local'
+public static final String DOCKER_RELEASE_REGISTRY ='dot-docker-release-local'
+public static final String ARTIFACTORY_DOMAIN ='artifactory.devops.dnb.net'
+
+	static String dockerSnapshotBaseUrl() {
+	return "${DOCKER_SNAPSHOT_REGISTRY}.${ARTIFACTORY_DOMAIN}:5000"
+	}
+	
+	static String snapshotPromotionEndpoint() {
+	return "https://${ARTIFACTORY_DOMAIN}/artifactory/api/docker/${DOCKER_SNAPSHOT_REGISTRY}/v2/promote"
+	}
+	
+	static String preReleasePromotionEndpoint() {
+	return "https://${ARTIFACTORY_DOMAIN}/artifactory/api/docker/${DOCKER_PRERELEASE_REGISTRY}/v2/promote"
+	}
+}
+
+rtMaven.deployer releaseRepo:'libs-release-local', snapshotRepo:'libs-snapshot-local', server: server
+rtMaven.resolver releaseRepo:'libs-release', snapshotRepo:'libs-snapshot-local', server: server
+
+pipeline {
+ agent { label 'dot-slave-with-java-build-tools' }
+ 		  stages {
+ 		   stage ('checkout_to_local_branch') {
+ 		  // agent { label java_agent }
+ 		   	steps {
+ 		   		checkout([$class: 'GitSCM', branches: [[name: "${DnBArtifactory.branch_name}"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'z-dot-ghec_dnbgit', url: "${DnBArtifactory.repo_name}"]]])
+				//checkout scm
+            }
+        }
+ 		  stage('build') {
+ 		  steps {
+ 		  script {
+			 echo "MAVEN_OPTS = " + env.MAVEN_OPTS
+            buildInfo = rtMaven.run pom: 'pom.xml', goals: 'clean -B -Dmaven.test.skip=true install -Dartifactory.publish.artifacts='+publishBuildArtifact, buildInfo: buildInfo
+            stash includes: 'target/*.jar', name: 'targetfiles'					
+				}
+			}
+		}
+		stage('Publish BuildInfo') {
+		 steps {
+		 	script {
+                      server.publishBuildInfo buildInfo
+                    }
+               }
+                          
+		}
+		   stage('Build Image') {
+			agent { label 'dot-kaniko-executor' }
+				steps {
+					script {
+       unstash 'targetfiles'
+                sh 'ls -l -R'
+
+          env.BUILD_REGISTRY = DnBArtifactory.dockerSnapshotBaseUrl()
+          env.IMAGE_NAME = "${DnBArtifactory.image_name}"
+          env.IMAGE_VERSION = "${DnBArtifactory.image_version_prefix}"+"${env.BUILD_NUMBER}"
+		echo 'Echo 1'
+          withCredentials([
+            usernamePassword(credentialsId: 'dot-jenkins-docker', usernameVariable: 'ART_USERNAME', passwordVariable: 'ART_PASSWORD')
+            ]) {
+            sh """echo "{\\"auths\\":{\\"${BUILD_REGISTRY}\\":{\\"username\\":\\"$ART_USERNAME\\",\\"password\\":\\"$ART_PASSWORD\\"}}}" > /kaniko/.docker/config.json"""
+            sh "DOCKER_CONFIG=/kaniko/.docker /kaniko/executor --context=dir://$WORKSPACE --insecure --skip-tls-verify --cache=true --force --destination=$BUILD_REGISTRY/$IMAGE_NAME:$IMAGE_VERSION --build-arg=JAR_FILE=target/*.jar"
+             echo 'Echo 3'
+
+            if (DnBArtifactory.promoteToPreRelease) {
+              sh """
+               curl -i -u$ART_USERNAME:$ART_PASSWORD -X POST "${DnBArtifactory.snapshotPromotionEndpoint()}" -H "Content-Type: application/json" -d '{"targetRepo":"${DnBArtifactory.DOCKER_PRERELEASE_REGISTRY}", "dockerRepository":"$IMAGE_NAME","tag":"$IMAGE_VERSION", "targetTag":"$IMAGE_VERSION", "copy":true}'
+              """
+              echo 'Echo 4'
+            }
+			if (DnBArtifactory.promoteToRelease) {
+              sh """
+               curl -i -u$ART_USERNAME:$ART_PASSWORD -X POST "${DnBArtifactory.snapshotPromotionEndpoint()}" -H "Content-Type: application/json" -d '{"targetRepo":"${DnBArtifactory.DOCKER_RELEASE_REGISTRY}", "dockerRepository":"$IMAGE_NAME","tag":"$IMAGE_VERSION", "targetTag":"$IMAGE_VERSION", "copy":true}'
+              """
+              echo 'Echo 4'
+            }
+          }
+        }
+      }
+    }
+		  }
+		 }
