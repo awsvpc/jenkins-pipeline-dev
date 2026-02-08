@@ -1,0 +1,58 @@
+import org.jenkinsci.plugins.workflow.libs.Library
+/*
+# What is job suppose to do
+# We want to pull all Dockerfiles from git, we build it with gradle.
+# We then want to login to artifactory and push the files with the correct labels
+# Easy enough.
+*/
+
+
+def dockerRepoCred = '769cab30-d8bc-480a-bb8a-efbbc0dd4373'
+def artCred        = ''
+
+def date
+def cmd = "./gradlew build --info -Dhttp.proxyHost=proxy.nchosting.dk -Dhttp.proxyPort=31280 -Dhttps.proxyHost=proxy.nchosting.dk -Dhttps.proxyPort=31280"
+def registry = "nc-dvo-docker.artifactory.nchosting.dk"
+def gitRepo   = 'http://5.44.143.222/nc-devops/docker-images.git'
+pipeline { 
+    agent any
+    environment {
+    ARTIFACTORY_CREDENTIALS = credentials('e5840ddb-f79e-493b-a964-3fb0ff8071d3')
+    }
+    stages {
+        stage ('Clone nc-devops/docker-images') {
+            steps {
+                git branch: 'master',
+                credentialsId: dockerRepoCred, 
+                url: gitRepo
+            }
+        }
+        stage ('Build current Docker images') {
+            steps {
+                sh script: cmd
+            }
+        }
+        stage ('Tag Docker images') {
+            steps {
+                script {
+                    date = new Date().format("ddMMyyyy")
+                }
+                sh script: "./gradlew -Prepo="+ registry + " -Ptag=latest tagImagesWithParams"
+                sh script: "./gradlew -Prepo="+ registry + " -Ptag=" + date + " tagImagesWithParams"
+            }
+        }
+        stage ('Publish Docker images') {
+            steps {
+                        sh script: "docker login nc-dvo-docker.artifactory.nchosting.dk --username=\${ARTIFACTORY_CREDENTIALS_USR} --password=\${ARTIFACTORY_CREDENTIALS_PSW}"
+                        sh script: "./gradlew -Prepo="+ registry + " pushImageWithParams --info" 
+              
+            }
+        }
+        stage ('Cleanup images') {
+            steps {
+                sh script: "./gradlew -Prepo="+ registry + " -Ptag=latest cleanImageWithParams"
+                sh script: "./gradlew -Prepo="+ registry + " -Ptag=" + date + " cleanImageWithParams"
+            }
+        }
+    }  
+}
