@@ -1,0 +1,77 @@
+pipeline {
+    agent any
+
+    tools {
+        maven "mvn"
+    }
+
+    environment {
+        DOCKER_REGISTRY = 'JFROG_ARTIFACTORY_URL'
+        ARTIFACTORY_USERNAME= 'JFROG_ARTIFACTORY_USERNAME'
+        ARTIFACTORY_PASSWORD= 'JFROG_ARTIFACTORY_PASSWORD'
+    }
+
+    stages {
+        stage('Checkout Source') {
+            steps {
+                git branch: 'main', url: 'SOURCE_CODE_GITHUB_URL'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                withEnv(['PATH+EXTRA=/Users/wso2/.rd/bin']) { // Add custom Docker path
+                    script {
+                        dir('INTEGRATION_ROOT_FOLDER_NAME') { // Replace with your integration root folder
+                            // Build the Docker image using Maven
+                            sh 'mvn clean install -Pdocker'
+
+                            // Extract artifactId and version
+                            def artifactId = sh(script: 'mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout', returnStdout: true).trim()
+                            def version = sh(script: 'mvn help:evaluate -Dexpression=project.version -q -DforceStdout', returnStdout: true).trim()
+
+                            // Compose Docker image name
+                            env.DOCKER_IMAGE = "${artifactId}:${version}"
+                            env.ARTIFACT_ID = "${artifactId}"
+
+                            echo "Docker Image Name: ${env.DOCKER_IMAGE}"
+                            echo "Docker Image Name: ${env.ARTIFACT_ID}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Image to JFrog Artifactory') {
+            steps {
+                withEnv(['PATH+EXTRA=/Users/wso2/.rd/bin']) { // Add custom Docker path
+                    script {
+                        // Log in to Docker registry
+                        sh '''
+                            echo $ARTIFACTORY_PASSWORD | docker login $DOCKER_REGISTRY -u $ARTIFACTORY_USERNAME --password-stdin
+                        '''
+
+                        // Tag and push Docker image with both version and 'latest'
+                        sh "docker tag ${env.DOCKER_IMAGE} ${DOCKER_REGISTRY}/${env.ARTIFACT_ID}:latest"
+
+                        // Push both tags
+                        sh "docker push ${DOCKER_REGISTRY}/${env.ARTIFACT_ID}:latest"
+                        
+                    }
+                }
+            }
+        }
+
+        stage('Clean Up Docker') {
+            steps {
+                withEnv(['PATH+EXTRA=/Users/wso2/.rd/bin']) { // Add custom Docker path
+                    script {
+                        // Remove local Docker image to save space
+                        sh "docker rmi ${env.DOCKER_IMAGE} || true"
+                        sh "docker rmi ${DOCKER_REGISTRY}/${env.ARTIFACT_ID}:latest || true"
+                    }
+                }
+            }
+        }
+    }
+}
