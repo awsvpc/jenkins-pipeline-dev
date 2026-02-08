@@ -1,0 +1,578 @@
+#!groovy
+
+@Library('utils') import de.tech26.Utils
+
+def utils = new Utils(steps, env, scm, currentBuild)
+def credentialsId = 'n26-jenkins-user_username-with-personal-access-token'
+def notificationUserMap = [: ]
+
+isManualPipeline = utils.projectName == "terraform-manual-apply"
+isApplyPipeline = utils.projectName == "Terraform Apply"
+isPullRequestPipeline = utils.projectName == "terraform-services"
+// notificationUserMap['<Jenkins username>'] = ['<Slack username>', '<Branch preference>', '<Status preference>']
+// Jenkins username will be used when you trigger a build manually from Jenkins.
+// If you also want notifications for your PRs, you will want to specify your git name (as configured in .gitconfig)
+// instead of the Jenkins username. Therefore a user might two entries.
+// Branch preference can be either all, or master, depending on if you only want notifications on the PRs you merge
+// or also on the builds of the branches you are working on
+// Status preference can be one of : any, on-failure (when build is not successful), or only-errors (only when the build explicitly fails)
+notificationUserMap['alejandroandreu']      = ['alejandro.andreu', "all", "any"]
+notificationUserMap['Alejandro Andreu']     = ['alejandro.andreu', "all", "any"]
+notificationUserMap['toivonen1979']         = ['antonio.santiago', "all", "any"]
+notificationUserMap['Antonio Santiago']     = ['antonio.santiago', "all", "any"]
+notificationUserMap['ckaye']                = ['calvin.kaye', "all", "any"]
+notificationUserMap['Calvin Kaye']          = ['calvin.kaye', "all", "any"]
+notificationUserMap['Eduardo Suarez']       = ['eduardo.suarez', "all", "any"]
+notificationUserMap['lyonsy']               = ['karl.lyons', "all", "any"]
+notificationUserMap['Karl Lyons']           = ['karl.lyons', "all", "any"]
+notificationUserMap['povils']               = ['Povilas Susinskas', "master", "any"]
+notificationUserMap['Povilas Susinskas']    = ['Povilas Susinskas', "master", "any"]
+notificationUserMap['Stanislav Petrashov']  = ['stanislav.petrashov', "all", "any"]
+notificationUserMap['waltervargas']         = ['walter.vargas', "all", "any"]
+notificationUserMap['Walter Vargas']        = ['walter.vargas', "all", "any"]
+notificationUserMap['wnagele']              = ['wolfgang.nagele', "all", "any"]
+notificationUserMap['Wolfgang Nagele']      = ['wolfgang.nagele', "all", "any"]
+notificationUserMap['mgagliardo']           = ['miguel.gagliardo', "all", "any"]
+notificationUserMap['Miguel Gagliardo']     = ['miguel.gagliardo', "all", "any"]
+notificationUserMap['Yurii Rochniak']       = ['Yura Rochniak', "all", "any"]
+
+node {
+    def currentCommitHash = ""
+
+    if  (isManualPipeline) {
+        stage('Prompt for target state') {
+            utils.configureBuild(
+            properties: [
+                    parameters([
+                        text(
+                            defaultValue: '',
+                            description: """Multiple state configs separated by a newline. Example:
+                            aws/eu/dev/fra/backend/services
+                            aws/us/staging/ore/backend/services""",
+                            name: 'STATE_CONFIGS'),
+                        text(
+                            defaultValue: '',
+                            description: """Multiple terraform target options separated by newline(without "-target"). Example:
+                            aws_route53_record.tech-entity-certificate-validation
+                            module.default-eu-peering""",
+                            name: 'STATE_TARGETS_OPTIONS'),
+                    ])
+            ]
+            )
+        }
+    }
+    else {
+        utils.configureBuild()
+    }
+
+    steps.checkout([
+            $class                           : 'GitSCM',
+            branches                         : [[name: "master"]],
+            doGenerateSubmoduleConfigurations: false,
+            extensions                       : [
+                [$class: 'LocalBranch'],
+                [$class: 'WipeWorkspace']
+            ],
+            userRemoteConfigs                : [[
+                $class        : 'UserRemoteConfig',
+                url           : 'https://github.com/n26/terraform.git',
+                name          : 'origin',
+                refspec       : "+refs/heads/master:refs/remotes/origin/master",
+                credentialsId : credentialsId
+            ]]
+    ])
+
+    if  (!isManualPipeline) {
+        currentCommitHash = checkout(scm).GIT_COMMIT
+    }
+
+    contextFactory = load 'jenkins/ContextFactory.groovy'
+    def stateConfigs = stateConfigs(env.BRANCH_NAME, env.STATE_CONFIGS)
+
+    stage("Terraform Lint") {
+        steps.sh "docker run --network none --rm -v \"\$(pwd):/data\" -t artifactory.cd-tech26.de/docker/wata727/tflint"
+    }
+
+    try {
+        if (stateConfigs) {
+            if (!isManualPipeline && !isApplyPipeline) {
+                stage("Terraform Format") {
+                    def terraformFormatMap = [: ]
+                    stateConfigs.each {
+                        stateConfig ->
+                            if (!stateConfig.contains("world") && !stateConfig.contains("global") && !stateConfig.contains("bank26") && !stateConfig.contains("n26corp") && !stateConfig.contains("aws/eu/cd") && !stateConfig.contains("aws/eu/infra-test/")) {
+                                terraformFormatMap[stateConfig] = {->
+                                    node {
+                                        sshagent([utils.credentials]) {
+                                            def context = contextFactory.create(stateConfig)
+                                            executeTerraformCommand(
+                                                "${context.terraformBinary()} fmt -check=true -diff=true",
+                                                context,
+                                                stateConfig,
+                                                currentCommitHash,
+                                                false
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                    }
+
+                    if (terraformFormatMap) {
+                        partitionedParallelExecute(terraformFormatMap)
+                    }
+                }
+
+                stage("Terraform Validate") {
+                    def terraformValidateMap = [: ]
+                    stateConfigs.each {
+                        stateConfig ->
+                            if (!stateConfig.contains("world") && !stateConfig.contains("global") && !stateConfig.contains("bank26") && !stateConfig.contains("n26corp") && !stateConfig.contains("aws/eu/cd") && !stateConfig.contains("aws/eu/infra-test/")) {
+                                terraformValidateMap[stateConfig] = {->
+                                    node {
+                                        sshagent([utils.credentials]) {
+                                            def context = contextFactory.create(stateConfig)
+                                            executeTerraformCommand(
+                                                "${context.terraformBinary()} validate -no-color -check-variables=false",
+                                                context,
+                                                stateConfig,
+                                                currentCommitHash
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                    }
+
+                    if (terraformValidateMap) {
+                        partitionedParallelExecute(terraformValidateMap)
+                    }
+                }
+            }
+
+            stage("Terraform Plan") {
+                def terraformPlanMap = [: ]
+                    stateConfigs.each {
+                        stateConfig ->
+                             if (!stateConfig.contains("github/repos") && !stateConfig.contains("world") && !stateConfig.contains("aws/eu/cd") && !stateConfig.contains("aws/eu/infra-test/") && !stateConfig.contains("bank26") && !stateConfig.contains("aws/eu/hq/global") && !stateConfig.contains("aws/eu/dr/global")) { // Github Plans take to long and spam Github API and there is no cockpit for global accounts
+                                terraformPlanMap[stateConfig] = {->
+                                    node {
+                                        sshagent([utils.credentials]) {
+                                            def context = contextFactory.create(stateConfig)
+                                            lock("terraform:${stateConfig}") {
+                                                executeTerraformCommand(
+                                                    "${context.terraformBinary()} plan -lock-timeout 300s ${buildTargetOptions()} -out \"${getPlanPath(stateConfig)}\"",
+                                                    context,
+                                                    stateConfig,
+                                                    currentCommitHash
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if (isManualPipeline) {
+                                echo "The state ${stateConfig} cannot be executed via our pipeline"
+                                throw new Exception("The state ${stateConfig} cannot be executed via our pipeline")
+                            }
+                    }
+                if (terraformPlanMap) {
+                    partitionedParallelExecute(terraformPlanMap)
+                }
+            }
+
+            if (  (env.BRANCH_NAME == "master" || isManualPipeline)) {
+
+                if (requiresApplyConfirmation(stateConfigs)) {
+                    stage("Confirm apply for pipeline") {
+                        // Display the plans before asking for approval
+                        def terraformShowMap = [: ]
+                        stateConfigs.each {
+                            stateConfig ->
+                                if (!stateConfig.contains("github/repos") && !stateConfig.contains("world") && !stateConfig.contains("aws/eu/cd") && !stateConfig.contains("aws/eu/infra-test/") && !stateConfig.contains("bank26") && !stateConfig.contains("n26corp") && !stateConfig.contains("aws/eu/hq/global") && !stateConfig.contains("aws/eu/dr/global")) { // Github Plans take to long and spam Github API and there is no cockpit for global accounts
+                                    node {
+                                        sshagent([utils.credentials]) {
+                                            def context = contextFactory.create(stateConfig)
+                                            executeTerraformCommand(
+                                                "${context.terraformBinary()} show ${getPlanPath(stateConfig)}",
+                                                context,
+                                                stateConfig,
+                                                currentCommitHash
+                                            )
+                                        }
+                                    }
+                                }
+                        }
+                        sendActionNotificationToUser(utils, notificationUserMap, stateConfigs.join(","))
+                        try {
+                            timeout(time: 180, unit: 'SECONDS') { // change to a convenient timeout for you
+                                applyState = input(
+                                id: "apply", message: "Do you want to terraform apply the previous plan?")
+                            }
+                            applyState = true
+                        } catch(err) { // timeout reached or input false
+                            def user = err.getCauses()[0].getUser()
+                            if('SYSTEM' == user.toString()) { // SYSTEM means timeout.
+                                echo "Aborted by timeout"
+                            } else {
+                                echo "Aborted by: [${user}]"
+                            }
+                            applyState = false
+                        }
+                    }
+                } else {
+                    applyState = true
+                }
+
+                if (applyState) {
+                    stage("Terraform Apply") {
+                        def terraformApplyMap = [: ]
+                        stateConfigs.each {
+                            stateConfig ->
+                                if (!stateConfig.contains("github/repos") && !stateConfig.contains("world") && !stateConfig.contains("aws/eu/cd") && !stateConfig.contains("aws/eu/infra-test/") && !stateConfig.contains("bank26") && !stateConfig.contains("n26corp") && !stateConfig.contains("aws/eu/hq/global") && !stateConfig.contains("aws/eu/dr/global")) { // Github Plans take to long and spam Github API and there is no cockpit for global accounts
+                                    terraformApplyMap[stateConfig] = {->
+                                        node {
+                                            sshagent([utils.credentials]) {
+                                                def context = contextFactory.create(stateConfig)
+                                                lock("terraform:${stateConfig}") {
+                                                    executeTerraformCommand(
+                                                        "${context.terraformBinary()} apply -auto-approve -lock-timeout 300s ${buildTargetOptions()} \"${getPlanPath(stateConfig)}\"",
+                                                        context,
+                                                        stateConfig,
+                                                        currentCommitHash
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                        }
+                        if (terraformApplyMap) {
+                            partitionedParallelExecute(terraformApplyMap)
+                        }
+                    }
+                }
+            }
+            currentBuild.result = "SUCCESS"
+        } else {
+           echo "No state change detected"
+        }
+    } catch (err) {
+
+        echo "ERROR: ${err}"
+
+        if (currentBuild.result == null) {
+            currentBuild.result = "FAILURE"
+        }
+
+    } finally {
+        cleanupPlanFiles(stateConfigs)
+        utils.sendNotification()
+        sendNotificationToUser(utils, notificationUserMap)
+    }
+}
+
+def getPlanPath(stateConfig, withFile = true) {
+    def fileName = ""
+    if (withFile) {
+        def tag = env.BUILD_TAG.replaceAll(' ', '_')
+        fileName ="${tag}.plan"
+    }
+    return "/root/terraform_plans/${stateConfig}/${fileName}"
+}
+
+
+def executeTerraformCommand(terraformCommand, context, stateConfig, commitHash, runInit = true) {
+    def terraformRepo = context.terraformRepository()
+
+    checkout scm
+
+    def currentDir = pwd()
+    def terraformVersionsHelper = load "${currentDir}/terraformVersions.groovy"
+    def terraformDockerImage = terraformVersionsHelper.getTerraformDockerImage(stateConfig)
+
+    if (!(terraformVersionsHelper.getTerraformVersion(stateConfig) in  ["0.11.14", "0.11.15"])) {
+
+      // -check-variables has been deprecated for terraform 0.12 and later
+      terraformCommand = terraformCommand.minus("-check-variables=false")
+    }
+
+
+    def mountPlan = ""
+    def terraformInitCommand = runInit ? "${context.terraformBinary()} init ${stateConfig} &&" : ""
+    def terraformCommandArgument = terraformCommand.split(' ')[1]
+
+    terraformCommand = "${terraformCommand} \"${stateConfig}\""
+
+    if (terraformCommandArgument in ["show", "apply", "plan"]) {
+        mountPlan = "-v \"${getPlanPath(stateConfig, false)}\":\"${getPlanPath(stateConfig, false)}\""
+    }
+
+    //If we are running a plan or apply, we need to source tf_notify_env
+    if(terraformCommandArgument in ["plan", "apply"]) {
+        terraformCommand = "source /srv/terraform/scripts/tf_notify_env && ${terraformCommand}"
+    }
+    //If we plan and in a PR, run tfnotify itself after plan
+    if (terraformCommandArgument == "plan" && isPullRequestPipeline && commitHash != "master") {
+        tfnotifyCommand = "tfnotify --config /srv/terraform/tfnotify.yml plan --title \\\"## Plan result of: ${stateConfig}\\\""
+        terraformCommand = "${terraformCommand} | ${tfnotifyCommand}"
+    }
+
+    def terraformFullCommand = "${terraformInitCommand} ${terraformCommand}"
+
+    def command = "sudo docker run --rm --dns 172.17.0.1 --entrypoint \"/bin/sh\" \
+        --label build_tag=\"${env.BUILD_TAG}\" \
+        --workdir /srv \
+        -e CONSUL_HTTP_ADDR='172.17.0.1:8500' -e PR_REVISION='${commitHash}' -e PR_ID='${env.CHANGE_ID}' -e BUILD_URL='${env.BUILD_URL}' \
+	-v /cert:/cert:ro \
+        -v /root:/root:ro -v /srv/terraform/terraform-ssh-keys:/tmp/terraform-ssh-keys:ro -v /cert:/usr/local/share/ca-certificates/ ${mountPlan} \
+        ${terraformDockerImage} -c \"git clone ${terraformRepo} \
+            && cd /srv/terraform \
+            && git checkout ${commitHash} \
+            && source /srv/terraform/scripts/update_ca_certs \
+            && if [ -d \"${stateConfig}\" ]; then ${terraformFullCommand}; fi \""
+
+    executeOnCockpit(command, context.cockpitName(), stateConfig)
+}
+
+
+def buildTargetOptions() {
+    return env.STATE_TARGETS_OPTIONS ? env.STATE_TARGETS_OPTIONS.split().collect({"-target $it"}).join(" ") : ""
+}
+
+def executeOnCockpit(command, cockpitName, label = null) {
+    steps.sh (script:"ssh automation@${cockpitName} '${command}'", label:"${label}")
+}
+
+def cleanupPlanFiles(stateConfigs) {
+    stateConfigs.each{
+        stateConfig ->
+            def context = contextFactory.create(stateConfig)
+            cleanupFile(getPlanPath(stateConfig), context)
+    }
+}
+
+def cleanupFile(file, context) {
+    executeOnCockpit("sudo rm -f \"${file}\"", context.cockpitName(), "Cleanup ${file}")
+}
+
+def stateConfigs(branchName, stateConfigsInput) {
+    echo "stateConfigs(branchName = ${branchName}, stateConfigsInput = ${stateConfigsInput}"
+
+    if (stateConfigsInput) {
+        return stateConfigsInput.split()
+    }
+
+    def changedFiles = ""
+    if (branchName == "master") {
+        changedFiles = changedFilesInMaster()
+    } else {
+        changedFiles = changedFilesInPullRequest()
+    }
+    def stateConfigs = []
+
+    for (file in changedFiles) {
+        if (file.endsWith(".tf")) {
+            stateConfigs << file.substring(0, file.lastIndexOf("/"))
+        }
+    }
+    echo "stateConfigs = ${stateConfigs}"
+    return stateConfigs.unique().findAll {
+        item -> !item.isEmpty() && fileExists(item)
+    }
+}
+
+def changedFilesInPullRequest() {
+    echo "changedFilesInPullRequest()"
+    def mergeCommit = steps.sh(script: "git merge-base FETCH_HEAD master", returnStdout: true)
+    def changedFiles = steps.sh(script: "git --no-pager diff --name-only FETCH_HEAD ${mergeCommit}", returnStdout: true)
+    echo "changedFiles = ${changedFiles}"
+    return changedFiles.split()
+}
+
+def changedFilesInMaster() {
+    echo "changedFilesInMaster()"
+    def changedFiles = steps.sh(script: "git --no-pager diff --name-only HEAD~1..HEAD", returnStdout: true)
+    echo "changedFiles = ${changedFiles}"
+    return changedFiles.split()
+}
+
+def checkDrift(file) {
+    return file.contains("aws/us/live") ||
+        file.contains("aws/eu/live") ||
+        file.contains("aws/eu/default")
+}
+
+def sendActionNotificationToUser(utils, notificationUserMap, state) {
+    echo "sendActionNotificationToUser(utils, notificationUserMap, state = ${state})"
+    causer = getUser()
+    echo "The user that caused this build is ${causer}"
+    if (notificationUserMap.containsKey(causer) && checkNotificationPreferences(env.BRANCH_NAME, currentBuild.result, notificationUserMap[causer][1], notificationUserMap[causer][2])) {
+        userToNotify = notificationUserMap[causer][0]
+        echo "Notifying ${userToNotify}"
+        notificationPreference = notificationUserMap[causer][1]
+        notifyUserForInput(utils, env.JOB_NAME, userToNotify, env.RUN_DISPLAY_URL, state)
+    }
+}
+
+def sendNotificationToUser(utils, notificationUserMap) {
+    echo "sendNotificationToUser(utils, notificationUserMap)"
+    causer = getUser()
+    echo "The user that caused this build is ${causer}"
+    if (notificationUserMap.containsKey(causer) && checkNotificationPreferences(env.BRANCH_NAME, currentBuild.result, notificationUserMap[causer][1], notificationUserMap[causer][2])) {
+        userToNotify = notificationUserMap[causer][0]
+        echo "Notifying ${userToNotify}"
+        notificationPreference = notificationUserMap[causer][1]
+        notifyUser(utils, env.JOB_NAME, userToNotify, currentBuild.result, env.RUN_DISPLAY_URL)
+    }
+}
+
+def notifyUser(utils, jobName, userToNotify, buildStatus, buildLink) {
+    echo "notifyUser(utils, ${jobName}, ${userToNotify}, ${buildStatus}, ${buildLink}"
+    def slackColor = "good"
+    def text = "👌 Show me the ✅"
+    def message = "Your build for ${jobName} finished successfully"
+    if (buildStatus == "FAILURE") {
+        slackColor = "danger"
+        text = "Take me to the build 👨‍🚒🔥🚒"
+        message = "Your build for ${jobName} failed!"
+    } else if (buildStatus == "UNSTABLE") {
+        slackColor = "warning"
+        text = "🙈🙈🙈 Go fix your tests!"
+        message = "Your build for ${jobName} is unstable"
+    }
+    def attachments = """[ {
+    "fallback": "Click here to see the failing build. ${buildLink}",
+    "color": "${slackColor}",
+    "actions": [{
+    "type": "button",
+    "text": "${text}",
+    "url": "${buildLink}"
+    }]
+    }
+    ]
+    """
+    echo "slackSend(channel: @${userToNotify}, color: ${slackColor}, attachments: ${attachments})"
+    slackSend(channel: "@${userToNotify}", message: message, color: slackColor, attachments: attachments)
+}
+
+def notifyUserForInput(utils, jobName, userToNotify, buildLink, state) {
+    echo "notifyUser(utils, ${jobName}, ${userToNotify}, ${buildLink}"
+    def slackColor = "warning"
+    def text = "🤙 Your input is needed for your Terraform build to apply ${state} 🤙"
+    def message = "Your input for Terraform: ${state} is needed!"
+
+    def attachments = """[
+            {
+                "fallback": "Click here to see the build. ${buildLink}",
+                "color": "${slackColor}",
+                "actions": [
+                    {
+                        "type": "button",
+                        "text": "${text}",
+                        "url": "${buildLink}"
+                    }
+                ]
+            }
+        ]"""
+    echo "slackSend(channel: @${userToNotify}, color: ${slackColor}, attachments: ${attachments})"
+    slackSend(channel: "@${userToNotify}", message: message, color: slackColor, attachments: attachments)
+}
+
+def requiresApplyConfirmation(stateConfigs) {
+    def whitelistedSubstrings = ["us/dev", "eu/dev", "us/staging", "eu/staging-legacy", "corp26/staging"]
+    for (stateConfig in stateConfigs) {
+        if (!stringContainsAnyItemFromList(stateConfig, whitelistedSubstrings)) {
+            return true
+        }
+    }
+
+    return false
+}
+
+def stringContainsAnyItemFromList(string, list) {
+    for (item in list) {
+        if (string.contains(item)) {
+            return true
+        }
+    }
+
+    return false
+}
+
+def getUser() {
+    // By default we return the user that invokes the job
+    def triggeredByUser = getCauser()
+    // If it's null or no-dev, then we get the user from the Commiter
+    if (triggeredByUser == null || triggeredByUser == "no-dev") {
+        triggeredByUser = getGitCommiterUser()
+    }
+    // When the commiter and the author are the same, the commiter has 'GitHub' as a value
+    // which will no trigger any notification. We can get the author value instead.
+    if (triggeredByUser == null || triggeredByUser == "GitHub") {
+        triggeredByUser = getGitAuthorUser()
+    }
+    return triggeredByUser
+}
+
+@NonCPS
+def getCauser() {
+    echo 'getCauser()'
+    def build = currentBuild.rawBuild
+    def upstreamCause
+    while (upstreamCause = build.getCause(hudson.model.Cause$UpstreamCause)) {
+        build = upstreamCause.upstreamRun
+    }
+    def triggeredByUser = build.getCause(hudson.model.Cause$UserIdCause)
+    echo "${triggeredByUser}"
+    return (triggeredByUser != null) ? triggeredByUser.userId : 'no-dev'
+}
+
+def getGitCommiterUser() {
+    gitUser = steps.sh(script: "git log -1 --pretty=format:'%cn'", returnStdout: true)
+    return gitUser.trim()
+}
+
+def getGitAuthorUser() {
+    gitUser = steps.sh(script: "git log -1 --pretty=format:'%an'", returnStdout: true)
+    return gitUser.trim()
+}
+
+def checkNotificationPreferences(branch, buildStatus, branchPreference, statusPreference) {
+    if (branchPreference == "all" || (branchPreference == "master" && branch == "master")) {
+        if (statusPreference == "any") {
+            return true
+        }
+        if (statusPreference == "on-failure" && buildStatus != "SUCCESS") {
+            return true
+        }
+        if (statusPreference == "only-errors" && buildStatus == "FAILURE") {
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+def dockerChanges(branchName) {
+    echo "dockerChanges(branchName = ${branchName}"
+
+    def changedFiles = ""
+    if (branchName == "master") {
+        changedFiles = changedFilesInMaster()
+    } else {
+        changedFiles = changedFilesInPullRequest()
+    }
+
+    for(item in changedFiles){
+        if(item.matches("docker(.*)")) {
+            return true
+        }
+    }
+    return false
+}
+
+def partitionedParallelExecute(LinkedHashMap map, int maxConcurrency = 8) {
+    (map.keySet() as List).collate(maxConcurrency).each { sm ->
+        steps.parallel map.subMap(sm)
+    }
+}
