@@ -1,0 +1,97 @@
+name: CI
+
+on: [push, create]
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Get Repo Name
+        id: reponame
+        run: echo ::set-env name=REPO::$(basename `git rev-parse --show-toplevel`)
+
+      - name: Get Branch
+        id: branchname
+        run: echo ::set-env name=BRANCH::${GITHUB_REF##*/}
+      
+      - name: Get Tag
+        id: tagname
+        run: echo ::set-env name=TAG::$(git describe --tags --abbrev=0)
+      
+      - name: Get Commit-Count
+        id: commitcount
+        run: echo ::set-env name=COMMIT_OFFSET::$(git rev-list $TAG.. --count)
+
+      - name: Set Semantic Versioning
+        id: semvername
+        run: |
+             if [[ "$BRANCH" == "master" || "$BRANCH" == "$TAG" ]]; then
+               if [[ "$COMMIT_OFFSET" == "0" ]]; then
+                 echo ::set-env name=SEMVERSION::$TAG
+               else
+                 echo ::set-env name=SEMVERSION::$TAG.$COMMIT_OFFSET
+               fi
+             else
+               echo ::set-env name=SEMVERSION::$TAG.$COMMIT_OFFSET.$BRANCH
+             fi
+      
+      - name: Display branch version
+        id: semverprint
+        run: echo $SEMVERSION
+
+      - name: Set up Python 3.7
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.7
+
+      - name: Install Poetry
+        uses: dschep/install-poetry-action@v1.2
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v1
+        id: cache
+        with:
+          path: ~/.virtualenvs
+          key: poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            poetry-${{ hashFiles('**/poetry.lock') }}
+      - name: Set Poetry config
+        run: |
+          poetry config virtualenvs.in-project false
+          poetry config virtualenvs.path ~/.virtualenvs
+      - name: Install Dependencies
+        run: poetry install
+        if: steps.cache.outputs.cache-hit != 'true'
+
+      - name: Code Quality
+        run: poetry run black .
+
+      - name: Test with pytest
+        env:
+          SECRET_TEST: ${{ secrets.SECRET_TEST }}
+        run: poetry run pytest --cov .
+
+      - name: Build with poetry
+        env:
+          SECRET_TEST: ${{ secrets.SECRET_TEST }}
+        run: poetry build
+      
+      - name: Deploy to artifactory
+        env:
+          ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+        run: poetry config repositories.artifactory ${{ secrets.ARTIFACTORY_PIPY_URL }} && poetry publish --repository artifactory --username $ARTIFACTORY_USER --password $ARTIFACTORY_PASSWORD
+
+      - name: Deploy image to artifactory
+        uses: elgohr/Publish-Docker-Github-Action@master
+        with:
+          name: ${{ github.event.repository.name }}
+          username: ${{ secrets.ARTIFACTORY_USER }}
+          password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          registry: ${{ secrets.ARTIFACTORY_GIT_URL
+          tags: ${{ env.SEMVERSION }}
+        env: 
+          ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}     
