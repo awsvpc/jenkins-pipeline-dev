@@ -1,0 +1,96 @@
+name: 'Commit Message Checker'
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+jobs:
+  check-commit-message:
+    name: Check Commit Message
+    runs-on: Linux
+    steps:
+      - name: Check Commit Type
+        uses: gsactions/commit-message-checker@v1.0.0
+        with:
+          pattern: '\[[A-Z]+\] .+$'
+          flags: 'gm'
+          error: 'PR title and commit messages must follow "[TAG] <Message>" syntax. Expected pattern: "\[[A-Z]+\] .+$"'
+          excludeTitle: false                              # check PR title
+          checkAllCommitMessages: true                     # check all commits
+          accessToken: ${{ secrets.GITHUB_TOKEN }}
+
+======================================
+
+name: publish-openapi
+on:
+  push:
+    branches:
+      - main
+jobs:
+  publish:
+    runs-on: Linux
+    container:
+      image: bitnami/git:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.0
+      - name: Setup Scala
+        uses: coursier/setup-action@v1.1.2
+        with:
+          jvm: adopt:11
+          apps: sbt
+      - name: Generate OpenAPI Spec
+        run: sbt "runMain com.example.OpenApiGenerator -f $GITHUB_WORKSPACE/openapi.yaml" -Dconfig.resource=openapi.conf
+      - name: Generate Swagger UI
+        uses: Legion2/swagger-ui-action@v1
+        with:
+          output: swagger-ui
+          spec-file: openapi.yaml
+      - name: Deploy
+        uses: peaceiris/actions-gh-pages@v3.8.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: swagger-ui
+
+
+=============================
+
+name: Test & Publish
+on:
+  pull_request:
+    types: [ "opened", "reopened" ]
+  push:
+    branches: [ "*" ]
+jobs:
+  test-and-publish:
+    runs-on: Linux
+    steps:
+      - uses: actions/checkout@v2.3.4
+        with:
+          fetch-depth: 0
+      - uses: coursier/setup-action@v1.1.2
+        with:
+          jvm: adopt:11
+          apps: sbt
+      - name: Test
+        run: make test
+      - name: Determine default branch
+        run: |
+          DEFAULT_BRANCH=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_ENV
+          echo "default_branch_ref=refs/heads/$DEFAULT_BRANCH" >> $GITHUB_ENV
+      - name: Bump version and push tag
+        if: github.ref == env.default_branch_ref
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.0
+        with:
+          tag_prefix: ""
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish
+        if: github.ref == env.default_branch_ref
+        env:
+          ARTIFACTORY_USERNAME: ${{secrets.ARTIFACTORY_USERNAME}}
+          ARTIFACTORY_PASSWORD: ${{secrets.ARTIFACTORY_PASSWORD}}
+        run: NEW_GIT_TAG="${{ steps.tag_version.outputs.new_tag }}" make publish
