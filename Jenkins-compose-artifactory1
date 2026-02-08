@@ -1,0 +1,54 @@
+def dockerArtifactoryRegistry = "your-docker-registry-here"
+def timestamp = new Date().format("MMddHHmmss", TimeZone.getTimeZone('UTC'))
+
+pipeline {
+  agent {
+    node {
+      label 'docker'
+      customWorkspace "automated-ui-tests"
+    }
+  }
+
+  environment {
+    DOCKER_SUFFIX = "${timestamp}"
+  }
+
+  stages {
+    stage('Run tests') {
+      steps {
+        sh "docker-compose pull"
+        sh "docker-compose up -d"
+
+        dir("src/AutomatedUiTests") {
+          sh """
+            docker run --name automated-ui-tests-${DOCKER_SUFFIX} --rm \
+              --network automated-ui-tests-${DOCKER_SUFFIX} \
+              -e WebDriver__Type=remote \
+              -e WebDriver__Remote__HubUrl=http://selenium-hub-${DOCKER_SUFFIX}:4444/wd/hub \
+              -e ApplicationUrl=http://web-app-${DOCKER_SUFFIX} \
+              -v \$(pwd):/workspace \
+              -w /workspace mikemcfarland/gauge-dotnet \
+              /bin/bash -c 'gauge run Specs/; rtn=\$?; chown -R 1002:1002 .; exit \$rtn'
+          """
+        }
+      }
+    }
+  }
+  post {
+    always {
+      sh "docker-compose down --remove-orphans"
+      sh "docker image prune -f"
+
+      publishHTML([
+        allowMissing: false,
+        alwaysLinkToLastBuild: true,
+        keepAll: true,
+        reportDir: 'src/AutomatedUiTests/Reports/html-report/',
+        reportFiles: 'index.html',
+        reportName: 'Gauge Report',
+        reportTitles: ''])
+
+        deleteDir()
+    }
+  }
+}
